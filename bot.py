@@ -55,6 +55,9 @@ probiv_state = {}
 # Словарь для хранения пользователей в чате
 chat_users = set()
 
+# Словарь для хранения времени последнего запроса помощи
+help_request_cooldown = {}
+
 # Список запрещенных слов
 banned_words = ["меня взломали", "скам", "скамят", "scam", "обман", "обманули"]
 
@@ -318,14 +321,16 @@ def generate_main_keyboard(user_id=None):
     markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=False)
     button_get_pass = telebot.types.KeyboardButton(text='Получить пароль')
     button_profile = telebot.types.KeyboardButton(text='Профиль')
+    button_help = telebot.types.KeyboardButton(text='❓ Помощь')
     
     # Проверяем является ли пользователь админом
     if user_id and (user_id in admin_ids or is_user_admin(user_id)):
         button_admin = telebot.types.KeyboardButton(text='⚙️ Админ-панель')
         markup.add(button_get_pass, button_profile)
-        markup.add(button_admin)
+        markup.add(button_help, button_admin)
     else:
         markup.add(button_get_pass, button_profile)
+        markup.add(button_help)
     
     return markup
 
@@ -364,6 +369,43 @@ def handle_profile_button(message):
 def handle_admin_panel_button(message):
     """Обработчик кнопки админ-панели"""
     admin_panel(message)
+
+@bot.message_handler(func=lambda message: message.text == "❓ Помощь")
+def handle_help_button(message):
+    """Обработчик кнопки помощи - отправляет сообщение админам"""
+    user_id = message.from_user.id
+    current_time = time.time()
+    
+    # Проверяем cooldown
+    if user_id in help_request_cooldown:
+        time_passed = current_time - help_request_cooldown[user_id]
+        if time_passed < 5:
+            remaining = int(5 - time_passed)
+            bot.reply_to(message, f"⏰ Подождите {remaining} секунд перед следующим запросом")
+            return
+    
+    # Обновляем время последнего запроса
+    help_request_cooldown[user_id] = current_time
+    
+    # Получаем информацию о пользователе
+    user_info = get_user_info(user_id)
+    if user_info:
+        username, _, _, unique_id, _, _ = user_info
+        
+        # Отправляем админам
+        for admin_id in admin_ids:
+            bot.send_message(
+                admin_id,
+                f"❓ Запрос помощи\n"
+                f"👤 @{username}\n"
+                f"🆔 {unique_id}\n"
+                f"⏰ {time.strftime('%H:%M:%S')}\n\n"
+                f"Используйте /msg {unique_id} <текст> для ответа"
+            )
+        
+        bot.reply_to(message, "✅ Ваш запрос отправлен модераторам. Ожидайте ответа.")
+    else:
+        bot.reply_to(message, "❌ Ошибка. Попробуйте /start")
 
 
 
