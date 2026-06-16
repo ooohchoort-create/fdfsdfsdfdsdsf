@@ -25,13 +25,20 @@ admin_ids = [int(id.strip()) for id in ADMIN_IDS_STR.split(',')]
 # Шифрование для куков
 ENCRYPTION_KEY = os.environ.get('ENCRYPTION_KEY')
 if ENCRYPTION_KEY:
-    cipher = Fernet(ENCRYPTION_KEY.encode())
+    try:
+        cipher = Fernet(ENCRYPTION_KEY.encode() if isinstance(ENCRYPTION_KEY, str) else ENCRYPTION_KEY)
+    except:
+        print("⚠️ ENCRYPTION_KEY невалидный! Генерируем новый...")
+        temp_key = Fernet.generate_key()
+        cipher = Fernet(temp_key)
+        print(f"⚠️ Добавьте в переменные окружения: ENCRYPTION_KEY={temp_key.decode()}")
 else:
-    # Генерируем ключ если не задан (НЕ БЕЗОПАСНО для продакшна!)
-    print("⚠️ ENCRYPTION_KEY не задан! Генерируем временный ключ...")
+    # Генерируем ключ если не задан
+    print("⚠️ ENCRYPTION_KEY не задан! Генерируем новый ключ...")
     temp_key = Fernet.generate_key()
     cipher = Fernet(temp_key)
-    print(f"⚠️ Добавьте в переменные окружения: ENCRYPTION_KEY={temp_key.decode()}")
+    print(f"⚠️ Скопируйте и добавьте в Apply.build переменную:")
+    print(f"ENCRYPTION_KEY={temp_key.decode()}")
 
 # Путь к файлу базы данных SQLite
 DATABASE_FILE = "user_database.db"
