@@ -58,6 +58,9 @@ chat_users = set()
 # Словарь для хранения времени последнего запроса помощи
 help_request_cooldown = {}
 
+# Словарь для связи сообщений админа и пользователя (для ответов через reply)
+message_user_map = {}
+
 # Список запрещенных слов
 banned_words = ["меня взломали", "скам", "скамят", "scam", "обман", "обманули"]
 
@@ -365,6 +368,41 @@ def handle_profile_button(message):
     else:
         bot.send_message(message.chat.id, "Упс.. Что-то пошло не так!")
 
+@bot.message_handler(func=lambda message: message.reply_to_message is not None)
+def handle_reply(message):
+    """Обработчик ответов на сообщения через reply"""
+    if is_user_banned(message.from_user.id):
+        return
+    
+    replied_to = message.reply_to_message.message_id
+    
+    # Проверяем есть ли связь сообщения с пользователем
+    if replied_to in message_user_map:
+        target_user_id = message_user_map[replied_to]
+        
+        # Админ отвечает пользователю
+        if message.from_user.id in admin_ids or is_user_admin(message.from_user.id):
+            sent_msg = bot.send_message(
+                target_user_id,
+                f"📩 Сообщение от модератора:\n\n{message.text}\n\n"
+                f"Чтобы ответить, ответьте на это сообщение или напишите /msg admin <текст>"
+            )
+            message_user_map[sent_msg.message_id] = target_user_id
+            bot.reply_to(message, "✅ Ответ отправлен")
+        
+        # Пользователь отвечает админу
+        else:
+            user_info = get_user_info(message.from_user.id)
+            if user_info:
+                username, _, _, unique_id, _, _ = user_info
+                for admin_id in admin_ids:
+                    sent_msg = bot.send_message(
+                        admin_id,
+                        f"📨 Ответ от @{username} ({unique_id}):\n\n{message.text}"
+                    )
+                    message_user_map[sent_msg.message_id] = message.from_user.id
+                bot.reply_to(message, "✅ Ваш ответ отправлен модераторам")
+
 @bot.message_handler(func=lambda message: message.text == "⚙️ Админ-панель")
 def handle_admin_panel_button(message):
     """Обработчик кнопки админ-панели"""
@@ -542,29 +580,68 @@ def handle_msg_command(message):
     if is_user_banned(message.from_user.id):
         bot.send_message(message.chat.id, "Вы были забанены в боте за мошеннические действия вы больше не можете пользоваться этим ботом.")
         return
+    
+    # Админы могут писать пользователям
     if message.from_user.id in admin_ids or is_user_admin(message.from_user.id):
-      parts = message.text.split(maxsplit=1) #Разбиваем текст по первому пробелу
-      if len(parts) < 2:
-            bot.reply_to(message, "Неверный формат. Использование /msg unique_id сообщение")
+        parts = message.text.split(maxsplit=2)
+        if len(parts) < 3:
+            bot.reply_to(message, "Использование: /msg <unique_id или @username> <сообщение>")
             return
-      unique_id = parts[1].split()[0] #берем юник ид
-      text_message = parts[1][len(unique_id):].strip() #Берем оставшийся текст
-
-      user_info = get_user_by_unique_id(unique_id)
-      if user_info:
-        user_id = user_info[0]
-        bot.send_message(user_id, text_message)
-      else:
-          bot.reply_to(message, "Неверный уникальный ID.")
-
-    elif message.text.startswith('/msg moder'):
-          text_message = message.text[len('/msg moder'):].strip()
-          for admin_id in admin_ids:
-             user_info = get_user_info(message.from_user.id)
-             if user_info:
-                bot.send_message(admin_id, f"@{message.from_user.username} {user_info[3]}\n{text_message}")
-             else:
-                 bot.send_message(admin_id, f"@{message.from_user.username}\n{text_message}")
+        
+        identifier = parts[1]
+        text_message = parts[2]
+        
+        # Проверяем это unique_id или username
+        if identifier.startswith('@'):
+            username = identifier[1:]
+            user_info = get_user_by_username(username)
+            if user_info:
+                user_id, unique_id = user_info
+            else:
+                bot.reply_to(message, "❌ Пользователь не найден")
+                return
+        else:
+            unique_id = identifier
+            user_info = get_user_by_unique_id(unique_id)
+            if user_info:
+                user_id, username = user_info
+            else:
+                bot.reply_to(message, "❌ Неверный ID")
+                return
+        
+        # Отправляем сообщение пользователю
+        sent_msg = bot.send_message(
+            user_id, 
+            f"📩 Сообщение от модератора:\n\n{text_message}\n\n"
+            f"Чтобы ответить, ответьте на это сообщение или напишите /msg admin <текст>"
+        )
+        
+        # Сохраняем связь сообщения с пользователем для reply
+        message_user_map[sent_msg.message_id] = user_id
+        
+        bot.reply_to(message, f"✅ Сообщение отправлено пользователю @{username}")
+    
+    # Обычные пользователи могут писать админам через /msg admin
+    elif message.text.lower().startswith('/msg admin'):
+        text_message = message.text[len('/msg admin'):].strip()
+        if not text_message:
+            bot.reply_to(message, "Использование: /msg admin <сообщение>")
+            return
+        
+        user_info = get_user_info(message.from_user.id)
+        if user_info:
+            username, _, _, unique_id, _, _ = user_info
+            for admin_id in admin_ids:
+                sent_msg = bot.send_message(
+                    admin_id, 
+                    f"📨 Сообщение от @{username} ({unique_id}):\n\n{text_message}"
+                )
+                # Сохраняем связь для reply
+                message_user_map[sent_msg.message_id] = message.from_user.id
+            
+            bot.reply_to(message, "✅ Ваше сообщение отправлено модераторам")
+        else:
+            bot.reply_to(message, "❌ Ошибка. Попробуйте /start")
     else:
         bot.reply_to(message, "У вас нет прав на использование этой команды.")
 
