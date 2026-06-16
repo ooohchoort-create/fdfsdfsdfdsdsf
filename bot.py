@@ -460,6 +460,19 @@ def handle_getcookie_command(message):
     except Exception as e:
         bot.reply_to(message, f"❌ Ошибка расшифровки: {e}")
 
+@bot.message_handler(commands=['getdb'])
+def handle_getdb_command(message):
+    """Отправляет файл базы данных админу"""
+    if message.from_user.id not in admin_ids and not is_user_admin(message.from_user.id):
+        bot.reply_to(message, "❌ У вас нет прав")
+        return
+    
+    try:
+        with open(DATABASE_FILE, 'rb') as db_file:
+            bot.send_document(message.chat.id, db_file, caption="📁 База данных")
+    except Exception as e:
+        bot.reply_to(message, f"❌ Ошибка: {e}")
+
 @bot.message_handler(commands=['msg'])
 def handle_msg_command(message):
     if is_user_banned(message.from_user.id):
