@@ -470,14 +470,14 @@ def handle_getcookie_command(message):
         # Расшифровываем
         decrypted_cookie = cipher.decrypt(encrypted_cookie.encode()).decode()
         
+        # Отправляем без Markdown парсинга
         bot.send_message(
             message.chat.id,
             f"🔓 Расшифрованные данные\n"
             f"👤 @{username}\n"
             f"🆔 {unique_id}\n"
             f"⏰ {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(created_at))}\n\n"
-            f"```\n{decrypted_cookie}\n```",
-            parse_mode='Markdown'
+            f"{decrypted_cookie}"
         )
     except Exception as e:
         bot.reply_to(message, f"❌ Ошибка расшифровки: {e}")
