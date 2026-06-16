@@ -540,18 +540,7 @@ def admin_panel(message):
         markup.add(button_users, button_broadcast, button_ban, button_unban, button_add_admin, button_remove_admin, button_probiv)
         bot.send_message(message.chat.id, "Админ-панель", reply_markup=markup)
     else:
-        bot.reply_to(message, f"❌ У вас нет прав.\n\nВаш ID: {message.from_user.id}\nАдмин IDs: {admin_ids}")
-
-@bot.message_handler(commands=['myid'])
-def show_my_id(message):
-    """Показывает ID пользователя и список админов"""
-    bot.reply_to(
-        message, 
-        f"🆔 Ваш Telegram ID: `{message.from_user.id}`\n"
-        f"👥 Админы: {admin_ids}\n"
-        f"✅ Вы админ: {'Да' if message.from_user.id in admin_ids else 'Нет'}",
-        parse_mode='Markdown'
-    )
+        bot.reply_to(message, "❌ У вас нет прав.")
 
 @bot.message_handler(func=lambda message: message.text == "👩‍👦Люди")
 def handle_users_button(message):
